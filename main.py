@@ -21,6 +21,18 @@ from rnn import load_model
 from rnn.utils import num_trainable_params
 from tqdm import tqdm
 
+
+# main.py の上部に追加
+class WeightedMSELoss(nn.Module):
+    def __init__(self, horizon=30, decay=0.95):
+        super().__init__()
+        self.weights = torch.tensor([decay**(horizon-i) for i in range(horizon)])
+
+    def forward(self, pred, target):
+        diff = (pred - target)**2
+        weighted_diff = diff * self.weights.unsqueeze(1).unsqueeze(2).to(pred.device)
+        return torch.mean(weighted_diff)
+
 #from scipy import signal
 
 # Keisuke Fujii, 2024
@@ -56,8 +68,33 @@ else:
     
 if args.Challenge:
     args.TEST = True
-
-def run_epoch(train,rollout,hp):
+# main.py の上部（他の関数と一緒に定義）
+def ensemble_prediction(models, data, n_samples=5):
+    all_preds = []
+    for model in models:
+        with torch.no_grad():
+            pred = model(data)
+            all_preds.append(pred)
+    
+    # 確率分布を考慮したサンプリング
+    mean_pred = torch.mean(torch.stack(all_preds), dim=0)
+    std_pred = torch.std(torch.stack(all_preds), dim=0)
+    return mean_pred + 0.5 * std_pred * torch.randn_like(std_pred)
+# main.py の上部（他の関数と一緒に定義）
+def apply_physical_constraints(prediction, field_size=(105, 68)):
+    # 座標をフィールドサイズ内にクリップ
+    prediction[..., 0] = torch.clamp(prediction[..., 0], -field_size[0]/2, field_size[0]/2)
+    prediction[..., 1] = torch.clamp(prediction[..., 1], -field_size[1]/2, field_size[1]/2)
+    
+    # 速度の最大値を制限 (m/s)
+    max_speed = 12.0  # サッカー選手の最高速度
+    velocity = prediction[..., 2:4]
+    speed = torch.norm(velocity, dim=-1, keepdim=True)
+    velocity = velocity * torch.clamp(max_speed / speed, max=1.0)
+    return torch.cat([prediction[..., 0:2], velocity], dim=-1)
+# main.py のトレーニングループの外（モデル定義の後に追加）
+criterion = WeightedMSELoss(horizon=args.horizon, decay=0.95)
+def run_epoch(train, rollout, hp):
     loader = train_loader if train == 1 else val_loader if train == 0 else test_loader
  
     losses = {} 
@@ -74,8 +111,20 @@ def run_epoch(train,rollout,hp):
             sample_nan += torch.sum(torch.isnan(data).any(dim=1).any(dim=2).any(dim=0))
             data = data[:,:,~torch.isnan(data).any(dim=1).any(dim=2).any(dim=0)]
 
+        # main.py のモデル出力部分
         if train == 1:
-            batch_losses, batch_losses2 = model(data, rollout, train, hp=hp)
+            # モデルの出力
+            pred = model(data, rollout, train, hp=hp)
+            
+            # 物理制約を適用
+            pred = apply_physical_constraints(pred)
+            
+            # ターゲットデータの準備
+            target = data[1:, :, :, :]  # 次のフレームをターゲットとする
+            
+            # 損失計算
+            batch_losses = criterion(pred, target)
+            
             optimizer.zero_grad()
             total_loss = sum(batch_losses.values())
             total_loss.backward()
@@ -113,7 +162,12 @@ def loss_str(losses):
         else: 
             ret += ' {}: {:.3f} |'.format(key, losses[key])
     return ret[:-2]
-
+# main.py の上部（他の関数と一緒に定義）
+def preprocess_test_data(data):
+    # ゴール前30フレームをゼロパディング
+    padded_data = torch.zeros((data.shape[0]+30, data.shape[1], data.shape[2]))
+    padded_data[30:] = data
+    return padded_data
 def run_sanity(args,test_loader):
     data = []
     for batch_idx, batch in enumerate(test_loader):
@@ -384,13 +438,18 @@ if __name__ == '__main__':
             # Stack agents and convert to tensor
             tensor = torch.tensor(data, dtype=torch.float32)  # Shape: (agents, length, dim)
 
-            if self.args.Modify_Velocity: 
-                vel = (tensor[:,1:,0:2] - tensor[:,:-1,0:2]) * self.args.fs
-                tensor[:,:-1,2:4] = vel
+            # if self.args.Modify_Velocity: 
+            #     vel = (tensor[:,1:,0:2] - tensor[:,:-1,0:2]) * self.args.fs
+            #     tensor[:,:-1,2:4] = vel
 
             tensor = tensor.permute(1, 0, 2)  # Shape: (length, agents, dim)
             tensor = tensor.reshape(tensor.size(0), -1)  # Flatten the last two dimensions
             tensor = tensor.unsqueeze(0) # agents, time, dim
+
+            # テストデータの場合、特別な前処理を適用
+            if self.challenge_data is not None:
+                tensor = preprocess_test_data(tensor)
+            
             return tensor
 
     # Challenge data
@@ -508,7 +567,11 @@ if __name__ == '__main__':
 
     # Load model
     
-    model = load_model(args.model, params, parser)
+    # main.py のモデル読み込み部分
+    if args.model == 'transformer':
+        model = TransformerPredictor(input_dim=featurelen, hidden_dim=128, nhead=8, num_layers=4)
+    else:
+        model = load_model(args.model, params, parser)
 
     if args.cuda:
         model.cuda()
@@ -630,6 +693,7 @@ if __name__ == '__main__':
     # Load ground-truth states from test set
     loader = test_loader 
 
+    # main.py のテスト部分
     if True:
         print('test sample')
         # Sample trajectory
@@ -645,7 +709,8 @@ if __name__ == '__main__':
                 # (batch, agents, time, feat) => (time, agents, batch, feat) 
             data = data.permute(2, 1, 0, 3)
             
-            sample, output, output2 = model.sample(data, rollout=True, burn_in=args.burn_in, n_sample=1, TEST = True, Challenge = args.Challenge)
+            # アンサンブル予測を実行
+            sample = ensemble_prediction(models, data, n_samples=5)
 
             samples[:,:,batch_idx*batchSize_test:(batch_idx+1)*batchSize_test] = sample.detach().cpu().numpy()[:-1]
 
@@ -664,7 +729,6 @@ if __name__ == '__main__':
                         losses2[key] = np.zeros((len_seqs_test))
                     losses[key] += np.sum(output2[key].detach().cpu().numpy(),axis=1)
                     losses2[key][batch_idx*batchSize_test:(batch_idx+1)*batchSize_test] = output2[key].detach().cpu().numpy()
-
 
         epoch_time = time.time() - start_time
         print('Time:\t {:.3f}'.format(epoch_time)) # Sample {} r*n_smp_b,

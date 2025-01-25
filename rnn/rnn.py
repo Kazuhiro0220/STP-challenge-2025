@@ -256,3 +256,16 @@ class RNN(nn.Module):
 
         states = states_n[0]
         return states, out, out2
+# rnn.py または transformer_model.py に追加
+class TransformerPredictor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, nhead, num_layers):
+        super().__init__()
+        self.encoder_layer = TransformerEncoderLayer(
+            d_model=input_dim, nhead=nhead, dim_feedforward=hidden_dim
+        )
+        self.transformer_encoder = TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+        self.decoder = nn.Linear(input_dim, 4)  # x,y,vx,vy
+
+    def forward(self, x):
+        x = self.transformer_encoder(x)
+        return self.decoder(x)
